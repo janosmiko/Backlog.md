@@ -19,6 +19,7 @@ import { openConfirmPopup } from "./components/confirm-popup.ts";
 import { createFilterHeader, type FilterHeader, type FilterState } from "./components/filter-header.ts";
 import { openMultiSelectFilterPopup, openSingleSelectFilterPopup } from "./components/filter-popup.ts";
 import { openHelpPopup } from "./components/help-popup.ts";
+import { openTaskComposerPopup } from "./components/task-composer.ts";
 import { formatFooterContent } from "./footer-content.ts";
 import { getStatusIcon } from "./status-icon.ts";
 import { completeTaskFromTui, formatTaskCompletionBlockedMessage } from "./task-lifecycle.ts";
@@ -170,8 +171,25 @@ function formatColumnLabel(status: string, count: number): string {
 	return `\u00A0${getStatusIcon(status)} ${status || "No Status"} (${count})\u00A0`;
 }
 
-const DEFAULT_FOOTER_CONTENT =
-	" {cyan-fg}[Tab]{/} View | {cyan-fg}[/]{/} Search | {cyan-fg}[T/P/F/I]{/} Filter | {cyan-fg}[←→/↑↓]{/} Nav | {cyan-fg}[Enter]{/} Details | {cyan-fg}[E/M/C/A]{/} Edit/Move/Comp/Arch | {cyan-fg}[Y]{/} Yank | {cyan-fg}[?]{/} Help | {cyan-fg}[q]{/} Quit";
+export const DEFAULT_FOOTER_CONTENT =
+	" {cyan-fg}[Tab]{/} View | {cyan-fg}[/]{/} Search | {cyan-fg}[T/P/F/I]{/} Filter | {cyan-fg}[←→/↑↓]{/} Nav | {cyan-fg}[Enter]{/} Details | {cyan-fg}[N]{/} New | {cyan-fg}[E/M/C/A]{/} Edit/Move/Comp/Arch | {cyan-fg}[H]{/} Hide Empty | {cyan-fg}[Y]{/} Yank | {cyan-fg}[?]{/} Help | {cyan-fg}[q]{/} Quit";
+
+export type ComposerFocusOutcome = "focus" | "draft" | "filtered";
+
+export function resolveComposerFocusOutcome(createdTask: Task, filteredTasks: Task[]): ComposerFocusOutcome {
+	if (createdTask.status === "Draft") {
+		return "draft";
+	}
+	return filteredTasks.some((task) => task.id === createdTask.id) ? "focus" : "filtered";
+}
+
+export function filterVisibleColumns(data: ColumnData[], hideEmptyColumns: boolean, isMoving: boolean): ColumnData[] {
+	if (!hideEmptyColumns || isMoving) {
+		return data;
+	}
+	const nonEmpty = data.filter((column) => column.tasks.length > 0);
+	return nonEmpty.length > 0 ? nonEmpty : data;
+}
 
 export function shouldRebuildColumns(current: ColumnData[], next: ColumnData[]): boolean {
 	if (current.length !== next.length) {
@@ -241,6 +259,7 @@ export async function renderBoardTui(
 		milestoneEntities?: Milestone[];
 		startupWarning?: string;
 		dateFormat?: string;
+		hideEmptyColumns?: boolean;
 	},
 ): Promise<void> {
 	if (!process.stdout.isTTY) {
@@ -277,6 +296,8 @@ export async function renderBoardTui(
 		let columns: ColumnView[] = [];
 		let currentColumnsData: ColumnData[] = [];
 		let currentStatuses = initialColumns.map((column) => column.status);
+		let hideEmptyColumns = options?.hideEmptyColumns ?? false;
+		let hideEmptyColumnsSaving = false;
 		let currentCol = 0;
 		let popupOpen = false;
 		let currentFocus: "board" | "filters" = "board";
@@ -638,7 +659,6 @@ export async function renderBoardTui(
 
 		const rebuildColumns = (data: ColumnData[], selectedTaskId?: string) => {
 			currentColumnsData = data;
-			currentStatuses = data.map((column) => column.status);
 			createColumnViews(data);
 			restoreSelection(selectedTaskId);
 		};
@@ -881,17 +901,18 @@ export async function renderBoardTui(
 
 		const renderView = () => {
 			const projectedData = getProjectedColumns(getFilteredTasks(), moveOp);
+			const dataForColumns = filterVisibleColumns(projectedData, hideEmptyColumns, Boolean(moveOp));
 
 			// If we are moving, we want to select the moving task
 			const selectedId = moveOp ? moveOp.taskId : getSelectedTaskId();
 
-			if (projectedData.length === 0) {
+			if (dataForColumns.length === 0) {
 				const fallbackStatus = currentStatuses[0] ?? "No Status";
 				rebuildColumns([{ status: fallbackStatus, tasks: [] }], selectedId);
-			} else if (shouldRebuildColumns(currentColumnsData, projectedData)) {
-				rebuildColumns(projectedData, selectedId);
+			} else if (shouldRebuildColumns(currentColumnsData, dataForColumns)) {
+				rebuildColumns(dataForColumns, selectedId);
 			} else {
-				applyColumnData(projectedData, selectedId);
+				applyColumnData(dataForColumns, selectedId);
 			}
 
 			updateFooter();
@@ -1537,6 +1558,68 @@ export async function renderBoardTui(
 						` {red-fg}Error archiving task: ${error instanceof Error ? error.message : "Unknown error"}{/}`,
 					);
 				}
+			}
+		});
+
+		screen.key(["S-h", "H"], async () => {
+			if (popupOpen || filterPopupOpen || modalOpen || currentFocus === "filters" || moveOp) return;
+			// Ignore toggles while a save is in flight: overlapping load/save
+			// cycles would write back stale config snapshots (lost updates).
+			if (hideEmptyColumnsSaving) return;
+			hideEmptyColumnsSaving = true;
+
+			const previous = hideEmptyColumns;
+			hideEmptyColumns = !hideEmptyColumns;
+			renderView();
+
+			try {
+				const core = new Core(process.cwd(), { enableWatchers: true });
+				const config = await core.fs.loadConfig();
+				if (!config) {
+					throw new Error("No config found");
+				}
+				await core.fs.saveConfig({ ...config, hideEmptyColumns });
+				showTransientFooter(
+					hideEmptyColumns ? " {green-fg}Hiding empty columns{/}" : " {green-fg}Showing empty columns{/}",
+				);
+			} catch (error) {
+				hideEmptyColumns = previous;
+				renderView();
+				showTransientFooter(
+					` {red-fg}Error saving hide empty columns setting: ${error instanceof Error ? error.message : "Unknown error"}{/}`,
+				);
+			} finally {
+				hideEmptyColumnsSaving = false;
+			}
+		});
+
+		screen.key(["n", "N", "S-n"], async () => {
+			if (popupOpen || filterPopupOpen || modalOpen || currentFocus === "filters" || moveOp) return;
+
+			const task = await runWithModalGuard(() =>
+				openTaskComposerPopup({
+					screen,
+					core: new Core(process.cwd(), { enableWatchers: true }),
+					statuses: currentStatuses,
+					types: options?.types,
+					priorities: options?.priorities,
+				}),
+			);
+			if (!task) return;
+
+			if (task.status !== "Draft") {
+				currentTasks = [...currentTasks, task];
+			}
+			const outcome = resolveComposerFocusOutcome(task, getFilteredTasks());
+			renderView();
+
+			if (outcome === "focus") {
+				restoreSelection(task.id);
+				showTransientFooter(` {green-fg}Created ${task.id}{/}`);
+			} else if (outcome === "draft") {
+				showTransientFooter(` {yellow-fg}Created draft ${task.id}{/} {gray-fg}(drafts aren't shown on the board){/}`);
+			} else {
+				showTransientFooter(` {yellow-fg}Created ${task.id}, but it is hidden by the current filters{/}`);
 			}
 		});
 

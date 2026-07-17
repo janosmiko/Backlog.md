@@ -133,7 +133,7 @@ export async function openSingleSelectFilterPopup(options: {
 			screen: options.screen,
 			title: options.title,
 			helpText:
-				options.helpText ?? " {cyan-fg}[↑↓]{/} Navigate | {cyan-fg}[Enter]{/} Select | {cyan-fg}[Esc]{/} Cancel",
+				options.helpText ?? " {cyan-fg}[↑↓/jk]{/} Navigate | {cyan-fg}[Enter]{/} Select | {cyan-fg}[Esc]{/} Cancel",
 			width: "48%",
 			height: "60%",
 		});
@@ -158,8 +158,8 @@ export async function openSingleSelectFilterPopup(options: {
 			width: "100%",
 			height: "100%",
 			items: options.choices.map((choice) => choice.label),
-			selected: selectedIndex,
 			keys: true,
+			vi: true,
 			mouse: true,
 			tags: true,
 			scrollable: true,
@@ -169,6 +169,9 @@ export async function openSingleSelectFilterPopup(options: {
 				item: { bg: "default", hover: { inverse: true } },
 			},
 		});
+		// list's constructor hardcodes selected = 0 and ignores options.selected,
+		// so the resting value must be applied explicitly once the list exists.
+		picker.select(selectedIndex);
 
 		const finish = (value: string | null) => {
 			if (settled) return;
