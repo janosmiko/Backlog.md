@@ -19,6 +19,7 @@ import { openConfirmPopup } from "./components/confirm-popup.ts";
 import { createFilterHeader, type FilterHeader, type FilterState } from "./components/filter-header.ts";
 import { openMultiSelectFilterPopup, openSingleSelectFilterPopup } from "./components/filter-popup.ts";
 import { openHelpPopup } from "./components/help-popup.ts";
+import { openTaskComposerPopup } from "./components/task-composer.ts";
 import { formatFooterContent } from "./footer-content.ts";
 import { getStatusIcon } from "./status-icon.ts";
 import { completeTaskFromTui, formatTaskCompletionBlockedMessage } from "./task-lifecycle.ts";
@@ -170,8 +171,17 @@ function formatColumnLabel(status: string, count: number): string {
 	return `\u00A0${getStatusIcon(status)} ${status || "No Status"} (${count})\u00A0`;
 }
 
-const DEFAULT_FOOTER_CONTENT =
-	" {cyan-fg}[Tab]{/} View | {cyan-fg}[/]{/} Search | {cyan-fg}[T/P/F/I]{/} Filter | {cyan-fg}[←→/↑↓]{/} Nav | {cyan-fg}[Enter]{/} Details | {cyan-fg}[E/M/C/A]{/} Edit/Move/Comp/Arch | {cyan-fg}[H]{/} Hide Empty | {cyan-fg}[Y]{/} Yank | {cyan-fg}[?]{/} Help | {cyan-fg}[q]{/} Quit";
+export const DEFAULT_FOOTER_CONTENT =
+	" {cyan-fg}[Tab]{/} View | {cyan-fg}[/]{/} Search | {cyan-fg}[T/P/F/I]{/} Filter | {cyan-fg}[←→/↑↓]{/} Nav | {cyan-fg}[Enter]{/} Details | {cyan-fg}[N]{/} New | {cyan-fg}[E/M/C/A]{/} Edit/Move/Comp/Arch | {cyan-fg}[H]{/} Hide Empty | {cyan-fg}[Y]{/} Yank | {cyan-fg}[?]{/} Help | {cyan-fg}[q]{/} Quit";
+
+export type ComposerFocusOutcome = "focus" | "draft" | "filtered";
+
+export function resolveComposerFocusOutcome(createdTask: Task, filteredTasks: Task[]): ComposerFocusOutcome {
+	if (createdTask.status === "Draft") {
+		return "draft";
+	}
+	return filteredTasks.some((task) => task.id === createdTask.id) ? "focus" : "filtered";
+}
 
 export function filterVisibleColumns(data: ColumnData[], hideEmptyColumns: boolean, isMoving: boolean): ColumnData[] {
 	if (!hideEmptyColumns || isMoving) {
@@ -1580,6 +1590,36 @@ export async function renderBoardTui(
 				);
 			} finally {
 				hideEmptyColumnsSaving = false;
+			}
+		});
+
+		screen.key(["n", "N", "S-n"], async () => {
+			if (popupOpen || filterPopupOpen || modalOpen || currentFocus === "filters" || moveOp) return;
+
+			const task = await runWithModalGuard(() =>
+				openTaskComposerPopup({
+					screen,
+					core: new Core(process.cwd(), { enableWatchers: true }),
+					statuses: currentStatuses,
+					types: options?.types,
+					priorities: options?.priorities,
+				}),
+			);
+			if (!task) return;
+
+			if (task.status !== "Draft") {
+				currentTasks = [...currentTasks, task];
+			}
+			const outcome = resolveComposerFocusOutcome(task, getFilteredTasks());
+			renderView();
+
+			if (outcome === "focus") {
+				restoreSelection(task.id);
+				showTransientFooter(` {green-fg}Created ${task.id}{/}`);
+			} else if (outcome === "draft") {
+				showTransientFooter(` {yellow-fg}Created draft ${task.id}{/} {gray-fg}(drafts aren't shown on the board){/}`);
+			} else {
+				showTransientFooter(` {yellow-fg}Created ${task.id}, but it is hidden by the current filters{/}`);
 			}
 		});
 
