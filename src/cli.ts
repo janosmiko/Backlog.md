@@ -477,6 +477,42 @@ function hasCreateFieldFlags(options: Record<string, unknown>): boolean {
 	);
 }
 
+/**
+ * Flags whose value cannot mean the same thing across a batch. A title, a body section, or a
+ * 1-based checklist index belongs to one task, so `task edit` rejects them once the user passes
+ * more than one task ID rather than writing the same value over every task.
+ */
+const PER_TASK_ONLY_EDIT_FLAGS: ReadonlyArray<{ option: string; flag: string }> = [
+	{ option: "title", flag: "--title" },
+	{ option: "description", flag: "--description" },
+	{ option: "desc", flag: "--desc" },
+	{ option: "plan", flag: "--plan" },
+	{ option: "appendPlan", flag: "--append-plan" },
+	{ option: "notes", flag: "--notes" },
+	{ option: "appendNotes", flag: "--append-notes" },
+	{ option: "finalSummary", flag: "--final-summary" },
+	{ option: "appendFinalSummary", flag: "--append-final-summary" },
+	{ option: "comment", flag: "--comment" },
+	{ option: "commentAuthor", flag: "--comment-author" },
+	{ option: "ordinal", flag: "--ordinal" },
+	{ option: "modifiedFile", flag: "--modified-file" },
+	{ option: "removeAc", flag: "--remove-ac" },
+	{ option: "checkAc", flag: "--check-ac" },
+	{ option: "uncheckAc", flag: "--uncheck-ac" },
+	{ option: "removeDod", flag: "--remove-dod" },
+	{ option: "checkDod", flag: "--check-dod" },
+	{ option: "uncheckDod", flag: "--uncheck-dod" },
+];
+
+function findPerTaskOnlyFlag(options: Record<string, unknown>): string | null {
+	for (const { option, flag } of PER_TASK_ONLY_EDIT_FLAGS) {
+		if (options[option] !== undefined) {
+			return `Cannot use ${flag} with more than one task ID. ${flag} applies to one task only. Run backlog task edit once per task.`;
+		}
+	}
+	return null;
+}
+
 function hasEditFieldFlags(options: Record<string, unknown>): boolean {
 	return Boolean(
 		options.title !== undefined ||
@@ -2725,9 +2761,14 @@ addHelpSchema(taskCmd.command("list"), {
 		cleanup();
 	});
 
-addHelpSchema(taskCmd.command("edit [taskId]"), {
+addHelpSchema(taskCmd.command("edit [taskIds...]"), {
 	required: [
-		{ name: "taskId", type: "Task ID", description: "Task to update; prompted when omitted in interactive mode" },
+		{
+			name: "taskIds",
+			type: "Task IDs",
+			description:
+				"Tasks to update; prompted when omitted in interactive mode. Several IDs apply the same shared-field change to every task",
+		},
 	],
 	optional: [
 		{ name: "title", type: "String", description: "Replacement task title" },
@@ -2803,6 +2844,7 @@ addHelpSchema(taskCmd.command("edit [taskId]"), {
 		'backlog task edit {{TASK_ID:1}} --status "<active status>" -a @sara',
 		`backlog task edit {{TASK_ID:1}} --type ${TASK_TYPE_EXAMPLE}`,
 		"backlog task edit {{TASK_ID:1}} --check-ac 1",
+		'backlog task edit {{TASK_ID:1}} {{TASK_ID:2}} --status "<active status>"',
 	],
 })
 	.description("edit an existing task")
@@ -2946,11 +2988,21 @@ addHelpSchema(taskCmd.command("edit [taskId]"), {
 		},
 	)
 	.option("--clear-docs", "remove all documentation (cannot combine with --doc)")
-	.action(async (taskId: string | undefined, options) => {
+	.action(async (taskIds: string[] | undefined, options) => {
+		const requestedTaskIds = (taskIds ?? []).map((value) => String(value).trim()).filter((value) => value.length > 0);
+		const taskId = requestedTaskIds[0];
 		const shouldUseWizard = hasInteractiveTTY && !hasEditFieldFlags(options);
 		if (!shouldUseWizard && !taskId) {
 			printMissingRequiredArgument("taskId");
 			return;
+		}
+		if (requestedTaskIds.length > 1) {
+			const perTaskFlagError = findPerTaskOnlyFlag(options);
+			if (perTaskFlagError) {
+				console.error(perTaskFlagError);
+				process.exitCode = 1;
+				return;
+			}
 		}
 
 		const cwd = await requireProjectRoot();
@@ -3005,10 +3057,24 @@ addHelpSchema(taskCmd.command("edit [taskId]"), {
 			return;
 		}
 
-		const existingTask = await core.loadTaskById(taskId ?? "");
+		const uniqueTaskIds = Array.from(new Set(requestedTaskIds));
+		const resolvedTasks: Task[] = [];
+		const editFailures: Array<{ taskId: string; message: string }> = [];
+		for (const requestedId of uniqueTaskIds) {
+			try {
+				const loaded = await core.loadTaskById(requestedId);
+				if (loaded) resolvedTasks.push(loaded);
+				else editFailures.push({ taskId: requestedId, message: `Task ${requestedId} not found.` });
+			} catch (error) {
+				editFailures.push({ taskId: requestedId, message: formatTaskEditError(error, requestedId) });
+			}
+		}
 
+		const existingTask = resolvedTasks[0];
 		if (!existingTask) {
-			console.error(`Task ${taskId} not found.`);
+			for (const failure of editFailures) {
+				console.error(failure.message);
+			}
 			process.exitCode = 1;
 			return;
 		}
@@ -3299,23 +3365,43 @@ addHelpSchema(taskCmd.command("edit [taskId]"), {
 			editArgs.definitionOfDoneUncheck = uncheckDod;
 		}
 
-		let updatedTask: Task;
-		try {
-			const updateInput = buildTaskUpdateInput(editArgs);
-			updatedTask = await core.editTask(existingTask.id, updateInput);
-		} catch (error) {
-			console.error(formatTaskEditError(error, existingTask.id));
-			process.exitCode = 1;
-			return;
-		}
-
 		const usePlainOutput = isPlainRequested(options);
-		if (usePlainOutput) {
-			console.log(formatTaskPlainText(updatedTask));
+
+		if (uniqueTaskIds.length === 1) {
+			let updatedTask: Task;
+			try {
+				updatedTask = await core.editTask(existingTask.id, buildTaskUpdateInput(editArgs));
+			} catch (error) {
+				console.error(formatTaskEditError(error, existingTask.id));
+				process.exitCode = 1;
+				return;
+			}
+
+			if (usePlainOutput) {
+				console.log(formatTaskPlainText(updatedTask));
+				return;
+			}
+
+			console.log(`Updated task ${updatedTask.id}`);
 			return;
 		}
 
-		console.log(`Updated task ${updatedTask.id}`);
+		// A batch applies the same change to independent files, so one failure must not stop the rest.
+		for (const task of resolvedTasks) {
+			try {
+				const updated = await core.editTask(task.id, buildTaskUpdateInput(editArgs));
+				console.log(`Updated task ${updated.id}`);
+			} catch (error) {
+				editFailures.push({ taskId: task.id, message: formatTaskEditError(error, task.id) });
+			}
+		}
+
+		for (const failure of editFailures) {
+			console.error(`Failed to update ${failure.taskId}: ${failure.message}`);
+		}
+		if (editFailures.length > 0) {
+			process.exitCode = 1;
+		}
 	});
 
 // Note: Implementation notes appending is handled via `task edit --append-notes` only.
